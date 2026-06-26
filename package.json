@@ -5,8 +5,9 @@
   "main": "src/cli.js",
   "type": "module",
   "scripts": {
-    "start": "node src/cli.js",
-    "dev": "node src/cli.js"
+    "start": "node --env-file-if-exists=.env src/cli.js",
+    "dev": "node --env-file-if-exists=.env src/cli.js",
+    "test": "node --test src/"
   },
   "keywords": [
     "git",
@@ -14,5 +15,9 @@
     "developer-tools"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "openai": "^6.45.0",
+    "tiktoken": "^1.0.22"
+  }
 }

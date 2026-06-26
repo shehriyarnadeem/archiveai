@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Secrets — never commit API keys
+.env
+.env.*
+
+# Generated cache of fetched commits
+commits.json
+src/commits.json

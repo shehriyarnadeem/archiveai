@@ -1,77 +1,214 @@
 /**
  * Entry point for the ArchivAI CLI
- * 
- * This file handles:
- * 1. Parsing command-line arguments (like --path)
- * 2. Calling the git reader
- * 3. Displaying results
- * 4. Handling errors gracefully
+ *
+ * Parses CLI args, loads commits (from git or cache), and displays them.
+ * Run `npm start -- --help` for usage.
  */
 
-// Import our custom modules
 import { getCommitHistory } from './git/reader.js';
 import { logCommit, logError, logSuccess } from './utils/logger.js';
+import { saveCommits, loadCommits, cacheExists } from './storage/cache.js';
+import { getTopAuthors } from './search/search.js';
 
 /**
- * Main function - runs when you type `npm start`
- * 
- * Why use an async main function?
- * - We need to await the git history
- * - Node.js doesn't support top-level await in CommonJS (only ES modules)
- * - Wrapping in an async function gives us a clean pattern
+ * Parse command-line arguments into an options object.
+ * Example: npm start -- --path /my/repo --limit 10 --cache --repl
  */
-async function main() {
-  // process.argv contains all command-line arguments
-  // process.argv[0] = path to Node.js executable
-  // process.argv[1] = path to this script (cli.js)
-  // process.argv[2...] = arguments passed by the user
-  // 
-  // Example: npm start -- --path /my/repo
-  // process.argv = ['node', 'cli.js', '--path', '/my/repo']
-  const args = process.argv.slice(2); // Remove first 2 items
-  let repoPath = '.'; // Default to current directory
-  
-  // Simple argument parser (no external libraries needed)
-  // We loop through args and look for --path followed by a value
-  // This is manual but keeps dependencies to zero
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--path' && i + 1 < args.length) {
-      repoPath = args[i + 1];
-      i++; // Skip the value so we don't process it again
-    }
+function parseArgs(argv) {
+  const opts = {
+    repoPath: '.', limit: 20, useCache: false, replMode: false, help: false,
+    command: null, question: '',
+  };
+
+  // Anything that isn't a recognized flag is a "positional" arg. We collect those
+  // separately so we can support a subcommand + free-text, e.g.
+  //   ask "why did we switch to ESM?"
+  // Here positional[0] = "ask" and the rest is the question.
+  const positional = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--path' && i + 1 < argv.length) opts.repoPath = argv[++i];
+    else if (arg === '--limit' && i + 1 < argv.length) opts.limit = parseInt(argv[++i], 10);
+    else if (arg === '--cache') opts.useCache = true;
+    else if (arg === '--repl') opts.replMode = true;
+    else if (arg === '--help' || arg === '-h') opts.help = true;
+    else positional.push(arg);
   }
 
-  console.log(`📂 Reading git history from: ${repoPath}`);
+  if (positional.length > 0) {
+    opts.command = positional[0];               // e.g. "ask"
+    opts.question = positional.slice(1).join(' '); // the rest, rejoined with spaces
+  }
+
+  return opts;
+}
+
+/**
+ * Load commits, preferring the cache when requested and available.
+ * Falls back to a fresh git read (and refreshes the cache) otherwise.
+ */
+async function fetchCommits({ repoPath, limit, useCache }) {
+  if (useCache && (await cacheExists())) {
+    const cached = await loadCommits();
+    if (cached) {
+      logSuccess(`Loaded ${cached.length} commits from cache`);
+      if (limit && limit < cached.length) {
+        console.log(`📊 Showing ${limit} of ${cached.length} commits (limited by --limit ${limit})`);
+        return cached.slice(0, limit);
+      }
+      return cached;
+    }
+    console.log('⚠️ Cache is empty or corrupted. Fetching fresh...');
+  }
+
+  const commits = await getCommitHistory(repoPath, limit);
+  console.log(`💾 Saving ${commits.length} commits to cache...`);
+  await saveCommits(commits);
+  return commits;
+}
+
+/**
+ * Handle the `ask` subcommand: load commits, assemble them into a prompt, and
+ * stream an AI answer to the user's question.
+ *
+ * Why lazy-import the AI modules? `ask.js` pulls in the OpenAI SDK and
+ * `context.js` boots a WASM tokenizer — heavy things a plain `npm start` should
+ * never load. We only import them on the ask path (same trick we use for --repl).
+ */
+async function handleAsk(opts) {
+  // No question? Show how to use it instead of sending an empty prompt.
+  if (!opts.question) {
+    logError('Please provide a question, e.g.\n  npm start -- ask "why did we switch to ESM?"');
+    process.exit(1);
+  }
+
+  const { assembleContext } = await import('./ai/context.js');
+  const { askQuestion, friendlyError } = await import('./ai/ask.js');
 
   try {
-    // Call our git reader - this is the main logic
-    const commits = await getCommitHistory(repoPath);
-    
-    logSuccess(`Found ${commits.length} commits`);
-    
-    // Loop through each commit and display it
-    commits.forEach((commit, index) => {
-      logCommit(commit, index);
-    });
+    // Reuse the same loader the default command uses (git or cache).
+    const commits = await fetchCommits(opts);
 
-    // Bonus: Show a summary table at the end
-    // console.table is a Node.js built-in that formats arrays of objects as tables
-    // Perfect for quick data exploration in the terminal
-    console.log('\n📊 Summary:');
-    console.table(commits.map(c => ({
-      Hash: c.hash.substring(0, 8),
-      Author: c.author,
-      Date: c.date.toLocaleDateString(),
-      Message: c.message.substring(0, 30) + (c.message.length > 30 ? '...' : '')
-    })));
+    // Turn commits into one prompt, respecting the token budget.
+    const { prompt, includedCommits, tokens, truncated } =
+      assembleContext(commits, opts.question);
 
+    // Tell the user what we're about to reason over — honesty about scope.
+    const note = truncated ? ' (older commits dropped to fit the budget)' : '';
+    console.log(`\n🧠 Reasoning over ${includedCommits} commit(s) · ~${tokens} tokens${note}\n`);
+    console.log(`❓ ${opts.question}\n`);
+
+    // Stream the answer to stdout (askQuestion prints each token as it arrives).
+    await askQuestion(prompt);
+    console.log('\n'); // trailing newline so the shell prompt isn't glued to the answer
   } catch (error) {
-    // If anything goes wrong, display a clean error message
-    logError(error.message);
-    process.exit(1); // Exit with error code (1 = failure)
+    // Map SDK/network/refusal errors to a clear, actionable message —
+    // never a raw stack trace.
+    logError(friendlyError(error));
+    process.exit(1);
   }
 }
 
-// Actually run the main function
-// This is the entry point of execution
+/** Print a summary table of commits with diff stats. */
+function printSummary(commits) {
+  console.log('\n📊 Summary:');
+  console.table(commits.map(c => {
+    const msg = c.message || '';
+    return {
+      Hash: c.hash.substring(0, 8),
+      Author: c.author,
+      Date: c.date.toLocaleDateString(),
+      Files: c.files?.length || 0,
+      Changes: `+${c.totalInsertions || 0}/-${c.totalDeletions || 0}`,
+      Message: msg.length > 30 ? msg.substring(0, 30) + '...' : msg,
+    };
+  }));
+}
+
+/** Print the top contributors (only meaningful with more than one commit). */
+function printTopAuthors(commits) {
+  if (commits.length <= 1) return;
+  console.log('\n🏆 Top Contributors:');
+  getTopAuthors(commits, 3).forEach((t, i) => {
+    console.log(`  ${i + 1}. ${t.author}: ${t.count} commits`);
+  });
+}
+
+function printNextSteps() {
+  console.log('\n💡 Next steps:');
+  console.log('  - Run with --repl to query your commits interactively');
+  console.log('  - Run with --cache to use cached data (faster startup)');
+  console.log('  - Try: npm start -- --repl');
+}
+
+function showHelp() {
+  console.log(`
+📚 ArchivAI CLI - Help
+
+USAGE:
+  npm start [COMMAND] [OPTIONS]
+
+COMMANDS:
+  ask "<question>"  Ask the AI why something in your history happened
+                    (needs OPENAI_API_KEY; optionally OPENAI_MODEL)
+
+OPTIONS:
+  --path <path>     Path to git repository (default: current directory)
+  --limit <number>  Number of commits to show (default: 20)
+  --cache           Use cached commits from commits.json (faster)
+  --repl            Start interactive REPL mode
+  --help, -h        Show this help message
+
+EXAMPLES:
+  npm start                                    # Show last 20 commits
+  npm start -- ask "why did we switch to ESM?" # Ask the AI about your history
+  npm start -- --path /my/repo --limit 10      # Show 10 commits from specific repo
+  npm start -- --cache                         # Load from cache
+  npm start -- --repl                          # Interactive query mode
+
+REPL COMMANDS (in --repl mode):
+  search <keyword>  - Find commits by keyword
+  top authors       - Show top contributors
+  recent <n>        - Show last n commits
+  stats             - Show repository statistics
+  help              - Show this message
+  exit              - Quit
+`);
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+
+  if (opts.help) return showHelp();
+
+  // The AI Q&A command takes priority over the default "list commits" behavior.
+  if (opts.command === 'ask') return handleAsk(opts);
+
+  if (opts.replMode) {
+    const { createRepl } = await import('./repl.js');
+    console.log('🧠 Starting ArchivAI Interactive Mode...\n');
+    return createRepl();
+  }
+
+  console.log(`📂 Reading git history from: ${opts.repoPath}`);
+
+  try {
+    const commits = await fetchCommits(opts);
+    logSuccess(`Found ${commits.length} commits`);
+
+    commits.forEach(logCommit);
+    printSummary(commits);
+    printTopAuthors(commits);
+    printNextSteps();
+  } catch (error) {
+    logError(error.message);
+    console.log('\n💡 Troubleshooting tips:');
+    console.log('  1. Make sure you\'re in a git repository');
+    console.log('  2. Try running with --path to specify a different repo');
+    console.log('  3. Check if git is installed: git --version');
+    process.exit(1);
+  }
+}
+
 main();
