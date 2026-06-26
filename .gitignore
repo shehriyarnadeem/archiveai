@@ -8,3 +8,8 @@ node_modules/
 # Generated cache of fetched commits
 commits.json
 src/commits.json
+
+# Local Claude Code context — not shared on remote
+CLAUDE.md
+DECISIONS.md
+.claude/
