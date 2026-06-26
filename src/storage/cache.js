@@ -13,11 +13,11 @@ const CACHE_FILE = path.join(process.cwd(), 'commits.json');
  * Save commits to cache
  * @param {Array} commits - Array of commit objects
  */
-async function saveCommits(commits) {
+async function saveCommits(commits, { quiet = false } = {}) {
   try {
     const data = JSON.stringify(commits, null, 2);
     await fs.writeFile(CACHE_FILE, data, 'utf-8');
-    console.log(`💾 Cached ${commits.length} commits to ${CACHE_FILE}`);
+    if (!quiet) console.log(`💾 Cached ${commits.length} commits to ${CACHE_FILE}`);
   } catch (error) {
     console.warn('⚠️ Failed to cache commits:', error.message);
   }
@@ -27,14 +27,14 @@ async function saveCommits(commits) {
  * Load commits from cache
  * @returns {Array|null} - Returns commits or null if cache doesn't exist
  */
-async function loadCommits() {
+async function loadCommits({ quiet = false } = {}) {
   try {
     const data = await fs.readFile(CACHE_FILE, 'utf-8');
     const commits = JSON.parse(data);
     // JSON has no Date type, so dates come back as strings — revive them
     // so consumers can call Date methods like toLocaleDateString().
     commits.forEach(c => { c.date = new Date(c.date); });
-    console.log(`📂 Loaded ${commits.length} commits from cache`);
+    if (!quiet) console.log(`📂 Loaded ${commits.length} commits from cache`);
     return commits;
   } catch (error) {
     // Cache doesn't exist or is corrupted

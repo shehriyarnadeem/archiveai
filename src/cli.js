@@ -48,23 +48,25 @@ function parseArgs(argv) {
  * Load commits, preferring the cache when requested and available.
  * Falls back to a fresh git read (and refreshes the cache) otherwise.
  */
-async function fetchCommits({ repoPath, limit, useCache }) {
+async function fetchCommits({ repoPath, limit, useCache, quiet = false }) {
+  // `quiet` suppresses the progress chatter — used by the `ask` command so its
+  // polished output isn't cluttered by cache messages.
   if (useCache && (await cacheExists())) {
-    const cached = await loadCommits();
+    const cached = await loadCommits({ quiet });
     if (cached) {
-      logSuccess(`Loaded ${cached.length} commits from cache`);
+      if (!quiet) logSuccess(`Loaded ${cached.length} commits from cache`);
       if (limit && limit < cached.length) {
-        console.log(`📊 Showing ${limit} of ${cached.length} commits (limited by --limit ${limit})`);
+        if (!quiet) console.log(`📊 Showing ${limit} of ${cached.length} commits (limited by --limit ${limit})`);
         return cached.slice(0, limit);
       }
       return cached;
     }
-    console.log('⚠️ Cache is empty or corrupted. Fetching fresh...');
+    if (!quiet) console.log('⚠️ Cache is empty or corrupted. Fetching fresh...');
   }
 
   const commits = await getCommitHistory(repoPath, limit);
-  console.log(`💾 Saving ${commits.length} commits to cache...`);
-  await saveCommits(commits);
+  if (!quiet) console.log(`💾 Saving ${commits.length} commits to cache...`);
+  await saveCommits(commits, { quiet });
   return commits;
 }
 
@@ -84,24 +86,37 @@ async function handleAsk(opts) {
   }
 
   const { assembleContext } = await import('./ai/context.js');
-  const { askQuestion, friendlyError } = await import('./ai/ask.js');
+  const { askQuestion, friendlyError, DEFAULT_MODEL } = await import('./ai/ask.js');
+  const { banner, box, wrap, style } = await import('./utils/ui.js');
+
+  // Show the branded banner up front — this is the screenshot's centerpiece.
+  console.log(banner());
 
   try {
-    // Reuse the same loader the default command uses (git or cache).
-    const commits = await fetchCommits(opts);
+    // Load commits quietly so cache messages don't clutter the polished output.
+    const commits = await fetchCommits({ ...opts, quiet: true });
 
     // Turn commits into one prompt, respecting the token budget.
     const { prompt, includedCommits, tokens, truncated } =
       assembleContext(commits, opts.question);
 
-    // Tell the user what we're about to reason over — honesty about scope.
-    const note = truncated ? ' (older commits dropped to fit the budget)' : '';
-    console.log(`\n🧠 Reasoning over ${includedCommits} commit(s) · ~${tokens} tokens${note}\n`);
-    console.log(`❓ ${opts.question}\n`);
+    // The question, framed in a titled panel (wrapped so long questions fit).
+    console.log(box(wrap(opts.question, 60), { title: 'QUESTION', borderColor: 'cyan' }));
+    console.log();
 
-    // Stream the answer to stdout (askQuestion prints each token as it arrives).
+    // Stream the answer live, under a header. askQuestion prints each token as it
+    // arrives; we time the call to show latency in the footer.
+    console.log(style('❯ Answer', 'bold', 'green'));
+    const started = Date.now();
     await askQuestion(prompt);
-    console.log('\n'); // trailing newline so the shell prompt isn't glued to the answer
+    const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+    // Stats footer — the subtle "this is real engineering" signal.
+    const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
+    const truncNote = truncated ? ' · history truncated' : '';
+    const footer =
+      `${includedCommits} commits · ~${tokens.toLocaleString()} tokens · ${model} · ${elapsed}s${truncNote}`;
+    console.log('\n' + box([footer], { borderColor: 'gray' }));
   } catch (error) {
     // Map SDK/network/refusal errors to a clear, actionable message —
     // never a raw stack trace.
