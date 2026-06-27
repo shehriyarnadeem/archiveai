@@ -1,229 +1,239 @@
 /**
- * Entry point for the ArchivAI CLI
+ * Entry point for the ArchivAI CLI.
  *
- * Parses CLI args, loads commits (from git or cache), and displays them.
+ * ArchivAI does one thing: answer "why did we build it this way?" over your
+ * project's git history. So the CLI *is* that Q&A interface — `npm start` drops
+ * you straight into an interactive question loop. There is intentionally no REPL,
+ * no commit-listing, no search/stats here anymore: those were scaffolding around
+ * the data layer, not the product. The engine underneath (git reader → context
+ * assembler → AI ask) is unchanged; this file is just the shell around it.
+ *
+ * File map (top → bottom): imports → config → arg parsing → history loading →
+ * rendering one answer → run modes (interactive loop) → help → bootstrap + entry.
+ *
  * Run `npm start -- --help` for usage.
  */
 
+import readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
+
 import { getCommitHistory } from './git/reader.js';
-import { logCommit, logError, logSuccess } from './utils/logger.js';
+import { logError } from './utils/logger.js';
 import { saveCommits, loadCommits, cacheExists } from './storage/cache.js';
-import { getTopAuthors } from './search/search.js';
+
+// --- Config -----------------------------------------------------------------
+
+// How many commits to pull from git for the session. This is an *internal* cap,
+// not a user knob: the context assembler trims the oldest commits to fit the
+// model's token budget anyway, so we read a generous slice and let it decide.
+const HISTORY_LIMIT = 200;
+
+// Words that end the interactive loop.
+const EXIT_WORDS = ['exit', 'quit', 'q'];
+
+// --- CLI argument parsing ----------------------------------------------------
 
 /**
  * Parse command-line arguments into an options object.
- * Example: npm start -- --path /my/repo --limit 10 --cache --repl
+ * Only three flags remain — everything else is treated as a (one-shot) question.
+ *   npm start                         -> interactive Q&A
+ *   npm start -- "why did we ...?"     -> answer once and exit
+ *   npm start -- --path /repo --cache  -> target another repo, use the cache
  */
 function parseArgs(argv) {
-  const opts = {
-    repoPath: '.', limit: 20, useCache: false, replMode: false, help: false,
-    command: null, question: '',
-  };
+  const opts = { repoPath: '.', useCache: false, help: false, question: '' };
 
-  // Anything that isn't a recognized flag is a "positional" arg. We collect those
-  // separately so we can support a subcommand + free-text, e.g.
-  //   ask "why did we switch to ESM?"
-  // Here positional[0] = "ask" and the rest is the question.
+  // Non-flag args are collected as the question text (joined back with spaces).
   const positional = [];
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--path' && i + 1 < argv.length) opts.repoPath = argv[++i];
-    else if (arg === '--limit' && i + 1 < argv.length) opts.limit = parseInt(argv[++i], 10);
     else if (arg === '--cache') opts.useCache = true;
-    else if (arg === '--repl') opts.replMode = true;
     else if (arg === '--help' || arg === '-h') opts.help = true;
     else positional.push(arg);
   }
 
-  if (positional.length > 0) {
-    opts.command = positional[0];               // e.g. "ask"
-    opts.question = positional.slice(1).join(' '); // the rest, rejoined with spaces
-  }
+  // Back-compat / muscle-memory: tolerate a leading "ask" keyword before the
+  // question (the old `ask "..."` subcommand) without folding it into the text.
+  if (positional[0]?.toLowerCase() === 'ask') positional.shift();
 
+  opts.question = positional.join(' ').trim();
   return opts;
 }
 
+// --- Git history loading -----------------------------------------------------
+
 /**
- * Load commits, preferring the cache when requested and available.
- * Falls back to a fresh git read (and refreshes the cache) otherwise.
+ * Load commits for the session, preferring the cache when asked.
+ * Always quiet — the polished Q&A output shouldn't be cluttered by cache chatter.
  */
-async function fetchCommits({ repoPath, limit, useCache, quiet = false }) {
-  // `quiet` suppresses the progress chatter — used by the `ask` command so its
-  // polished output isn't cluttered by cache messages.
+async function fetchCommits({ repoPath, useCache }) {
   if (useCache && (await cacheExists())) {
-    const cached = await loadCommits({ quiet });
-    if (cached) {
-      if (!quiet) logSuccess(`Loaded ${cached.length} commits from cache`);
-      if (limit && limit < cached.length) {
-        if (!quiet) console.log(`📊 Showing ${limit} of ${cached.length} commits (limited by --limit ${limit})`);
-        return cached.slice(0, limit);
-      }
-      return cached;
-    }
-    if (!quiet) console.log('⚠️ Cache is empty or corrupted. Fetching fresh...');
+    const cached = await loadCommits({ quiet: true });
+    if (cached?.length) return cached;
   }
 
-  const commits = await getCommitHistory(repoPath, limit);
-  if (!quiet) console.log(`💾 Saving ${commits.length} commits to cache...`);
-  await saveCommits(commits, { quiet });
+  const commits = await getCommitHistory(repoPath, HISTORY_LIMIT);
+  await saveCommits(commits, { quiet: true }); // refresh the cache for next time
   return commits;
 }
 
+// --- Rendering a single answer ----------------------------------------------
+
 /**
- * Handle the `ask` subcommand: load commits, assemble them into a prompt, and
- * stream an AI answer to the user's question.
+ * Answer a single question: assemble the history into a prompt, stream the AI
+ * answer, and print a stats footer. Shared by both the one-shot and interactive
+ * paths so the experience (and the screenshot aesthetic) is identical.
  *
- * Why lazy-import the AI modules? `ask.js` pulls in the OpenAI SDK and
- * `context.js` boots a WASM tokenizer — heavy things a plain `npm start` should
- * never load. We only import them on the ask path (same trick we use for --repl).
+ * @param {Object} engine - the loaded modules + commits (see bootstrap()).
+ * @param {string} question
+ * @param {Object} [opts]
+ * @param {boolean} [opts.showQuestion] - draw the question in a titled box first.
+ *        On for one-shot (the question came from argv, so echo it); off in the
+ *        loop (the user just typed it at the prompt — re-boxing it is noise).
  */
-async function handleAsk(opts) {
-  // No question? Show how to use it instead of sending an empty prompt.
-  if (!opts.question) {
-    logError('Please provide a question, e.g.\n  npm start -- ask "why did we switch to ESM?"');
-    process.exit(1);
+async function answer(engine, question, { showQuestion = false } = {}) {
+  const { assembleContext, askQuestion, friendlyError, DEFAULT_MODEL,
+          box, wrap, style, commits } = engine;
+
+  // Turn commits into one prompt, respecting the token budget.
+  const { prompt, includedCommits, tokens, truncated } =
+    assembleContext(commits, question);
+
+  if (showQuestion) {
+    console.log(box(wrap(question, 60), { title: 'QUESTION', borderColor: 'cyan' }));
   }
 
+  // Stream the answer live under a header; time it for the footer.
+  console.log();
+  console.log(style('❯ Answer', 'bold', 'green'));
+  const started = Date.now();
+  try {
+    await askQuestion(prompt);
+  } catch (error) {
+    // Per-question errors (rate limit, transient network, refusal) must NOT kill
+    // an interactive session — surface a friendly message and let the user retry.
+    console.log();
+    logError(friendlyError(error));
+    return;
+  }
+  const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+  // Stats footer — the subtle "this is real engineering" signal.
+  const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
+  const truncNote = truncated ? ' · history truncated' : '';
+  const footer =
+    `${includedCommits} commits · ~${tokens.toLocaleString()} tokens · ${model} · ${elapsed}s${truncNote}`;
+  console.log('\n' + box([footer], { borderColor: 'gray' }));
+}
+
+// --- Run modes ---------------------------------------------------------------
+
+/**
+ * The interactive Q&A loop: read a question, answer it, repeat until the user
+ * types `exit` (or hits Ctrl-C). History is loaded once and reused across all
+ * questions in the session.
+ */
+async function interactive(engine) {
+  const { style, commits } = engine;
+  const rl = readline.createInterface({ input, output });
+
+  // Ctrl-C should quit cleanly, not dump a rejected-promise stack trace.
+  rl.on('SIGINT', () => { rl.close(); process.exit(0); });
+
+  console.log(style(
+    `\nLoaded ${commits.length} commits. Ask anything about your project's history.`,
+    'dim'));
+  console.log(style("Type a question and press Enter — 'exit' or Ctrl-C to quit.", 'dim'));
+
+  while (true) {
+    let question;
+    try {
+      question = (await rl.question(style('\n❯ ', 'bold', 'cyan'))).trim();
+    } catch {
+      break; // stream closed (e.g. Ctrl-D) — treat as exit
+    }
+    if (!question) continue;
+    if (EXIT_WORDS.includes(question.toLowerCase())) break;
+    await answer(engine, question);
+  }
+
+  rl.close();
+  console.log(style('\nGoodbye 👋', 'dim'));
+}
+
+// --- Help --------------------------------------------------------------------
+
+function showHelp() {
+  console.log(`
+📚 ArchivAI — ask your codebase why.
+
+USAGE:
+  npm start                          Start the interactive Q&A interface
+  npm start -- "<question>"          Ask one question and exit
+  npm start -- --path <path>         Target another git repository
+  npm start -- --cache               Use cached commits (faster startup)
+  npm start -- --help, -h            Show this help
+
+EXAMPLES:
+  npm start
+  npm start -- "why did we switch to ESM?"
+  npm start -- --path /my/repo --cache
+
+Requires OPENAI_API_KEY (optionally OPENAI_MODEL). Put them in a local .env.
+`);
+}
+
+// --- Bootstrap & entry -------------------------------------------------------
+
+/**
+ * Load the heavy machinery once and bundle it into a single "engine" object the
+ * answer/loop helpers share: the AI + tokenizer + UI modules, plus the session's
+ * commits. Kept out of main() so the entry point stays a thin dispatcher — and so
+ * none of this is paid for on the --help path.
+ */
+async function bootstrap(opts) {
+  // Dynamic imports: the OpenAI SDK + WASM tokenizer + UI are expensive, so we
+  // only load them here, once we know we're actually going to answer a question.
   const { assembleContext } = await import('./ai/context.js');
   const { askQuestion, friendlyError, DEFAULT_MODEL } = await import('./ai/ask.js');
   const { banner, box, wrap, style } = await import('./utils/ui.js');
 
-  // Show the branded banner up front — this is the screenshot's centerpiece.
+  // The branded banner up front — the screenshot's centerpiece.
   console.log(banner());
 
+  let commits;
   try {
-    // Load commits quietly so cache messages don't clutter the polished output.
-    const commits = await fetchCommits({ ...opts, quiet: true });
-
-    // Turn commits into one prompt, respecting the token budget.
-    const { prompt, includedCommits, tokens, truncated } =
-      assembleContext(commits, opts.question);
-
-    // The question, framed in a titled panel (wrapped so long questions fit).
-    console.log(box(wrap(opts.question, 60), { title: 'QUESTION', borderColor: 'cyan' }));
-    console.log();
-
-    // Stream the answer live, under a header. askQuestion prints each token as it
-    // arrives; we time the call to show latency in the footer.
-    console.log(style('❯ Answer', 'bold', 'green'));
-    const started = Date.now();
-    await askQuestion(prompt);
-    const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-
-    // Stats footer — the subtle "this is real engineering" signal.
-    const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
-    const truncNote = truncated ? ' · history truncated' : '';
-    const footer =
-      `${includedCommits} commits · ~${tokens.toLocaleString()} tokens · ${model} · ${elapsed}s${truncNote}`;
-    console.log('\n' + box([footer], { borderColor: 'gray' }));
-  } catch (error) {
-    // Map SDK/network/refusal errors to a clear, actionable message —
-    // never a raw stack trace.
-    logError(friendlyError(error));
-    process.exit(1);
-  }
-}
-
-/** Print a summary table of commits with diff stats. */
-function printSummary(commits) {
-  console.log('\n📊 Summary:');
-  console.table(commits.map(c => {
-    const msg = c.message || '';
-    return {
-      Hash: c.hash.substring(0, 8),
-      Author: c.author,
-      Date: c.date.toLocaleDateString(),
-      Files: c.files?.length || 0,
-      Changes: `+${c.totalInsertions || 0}/-${c.totalDeletions || 0}`,
-      Message: msg.length > 30 ? msg.substring(0, 30) + '...' : msg,
-    };
-  }));
-}
-
-/** Print the top contributors (only meaningful with more than one commit). */
-function printTopAuthors(commits) {
-  if (commits.length <= 1) return;
-  console.log('\n🏆 Top Contributors:');
-  getTopAuthors(commits, 3).forEach((t, i) => {
-    console.log(`  ${i + 1}. ${t.author}: ${t.count} commits`);
-  });
-}
-
-function printNextSteps() {
-  console.log('\n💡 Next steps:');
-  console.log('  - Run with --repl to query your commits interactively');
-  console.log('  - Run with --cache to use cached data (faster startup)');
-  console.log('  - Try: npm start -- --repl');
-}
-
-function showHelp() {
-  console.log(`
-📚 ArchivAI CLI - Help
-
-USAGE:
-  npm start [COMMAND] [OPTIONS]
-
-COMMANDS:
-  ask "<question>"  Ask the AI why something in your history happened
-                    (needs OPENAI_API_KEY; optionally OPENAI_MODEL)
-
-OPTIONS:
-  --path <path>     Path to git repository (default: current directory)
-  --limit <number>  Number of commits to show (default: 20)
-  --cache           Use cached commits from commits.json (faster)
-  --repl            Start interactive REPL mode
-  --help, -h        Show this help message
-
-EXAMPLES:
-  npm start                                    # Show last 20 commits
-  npm start -- ask "why did we switch to ESM?" # Ask the AI about your history
-  npm start -- --path /my/repo --limit 10      # Show 10 commits from specific repo
-  npm start -- --cache                         # Load from cache
-  npm start -- --repl                          # Interactive query mode
-
-REPL COMMANDS (in --repl mode):
-  search <keyword>  - Find commits by keyword
-  top authors       - Show top contributors
-  recent <n>        - Show last n commits
-  stats             - Show repository statistics
-  help              - Show this message
-  exit              - Quit
-`);
-}
-
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-
-  if (opts.help) return showHelp();
-
-  // The AI Q&A command takes priority over the default "list commits" behavior.
-  if (opts.command === 'ask') return handleAsk(opts);
-
-  if (opts.replMode) {
-    const { createRepl } = await import('./repl.js');
-    console.log('🧠 Starting ArchivAI Interactive Mode...\n');
-    return createRepl();
-  }
-
-  console.log(`📂 Reading git history from: ${opts.repoPath}`);
-
-  try {
-    const commits = await fetchCommits(opts);
-    logSuccess(`Found ${commits.length} commits`);
-
-    commits.forEach(logCommit);
-    printSummary(commits);
-    printTopAuthors(commits);
-    printNextSteps();
+    commits = await fetchCommits(opts);
   } catch (error) {
     logError(error.message);
-    console.log('\n💡 Troubleshooting tips:');
-    console.log('  1. Make sure you\'re in a git repository');
-    console.log('  2. Try running with --path to specify a different repo');
-    console.log('  3. Check if git is installed: git --version');
+    console.log('\n💡 Make sure you\'re in a git repo (or pass --path), and git is installed.');
     process.exit(1);
   }
+
+  return {
+    assembleContext, askQuestion, friendlyError, DEFAULT_MODEL,
+    banner, box, wrap, style, commits,
+  };
+}
+
+/**
+ * Entry point: parse args, then dispatch. A question on the command line runs
+ * one-shot (great for scripts/screenshots); its absence opens the interactive
+ * interface. Everything heavy lives in bootstrap(), so this stays a dispatcher.
+ */
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  if (opts.help) return showHelp();
+
+  const engine = await bootstrap(opts);
+
+  if (opts.question) {
+    await answer(engine, opts.question, { showQuestion: true });
+    return;
+  }
+  await interactive(engine);
 }
 
 main();
